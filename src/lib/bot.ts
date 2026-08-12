@@ -55,7 +55,7 @@ bot.help((ctx) => {
   ctx.reply(
     'Command yang tersedia:\n' +
     '/saldo - Cek saldo saat ini\n' +
-    '/riwayat - Lihat 10 transaksi terakhir\n' +
+    '/riwayat - Lihat riwayat transaksi (opsi: /riwayat [jumlah] [tgl\\_mulai] [tgl\\_akhir])\n' +
     '/tambahdompet [nama] - Buat dompet baru\n' +
     '/tambahkategori [nama] - Buat kategori baru\n' +
     '/topup - Tambah saldo pemasukan\n' +
@@ -64,42 +64,122 @@ bot.help((ctx) => {
   );
 });
 
-// --- /riwayat: Tampilkan 10 pengeluaran + 10 topup terakhir ---
+// --- /riwayat: Tampilkan riwayat transaksi dengan opsi jumlah & filter tanggal ---
+// Usage: /riwayat [n] [tanggal_mulai] [tanggal_akhir]
+// - n: jumlah transaksi per tipe (default 10)
+// - tanggal format: dd/mm/yyyy atau dd-mm-yyyy
+// Contoh: /riwayat 20
+//         /riwayat 5 01/08/2026
+//         /riwayat 15 01/08/2026 13/08/2026
 bot.command('riwayat', async (ctx) => {
     try {
-        // Fetch 10 pengeluaran terakhir
-        const { data: debits } = await supabase.from('transactions').select(`
+        // Parse arguments
+        const args = ctx.message.text.split(/\s+/).slice(1);
+        let limit = 10;
+        let dateFrom: Date | null = null;
+        let dateTo: Date | null = null;
+
+        // Helper: parse dd/mm/yyyy or dd-mm-yyyy to Date
+        const parseDate = (str: string): Date | null => {
+            const m = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+            if (!m) return null;
+            const d = new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
+            return isNaN(d.getTime()) ? null : d;
+        };
+
+        // Classify each argument as number (limit) or date
+        const dateArgs: Date[] = [];
+        for (const arg of args) {
+            if (/^\d+$/.test(arg) && dateArgs.length === 0) {
+                // Pure number before any date → treat as limit
+                limit = Math.max(1, Math.min(parseInt(arg, 10), 50));
+            } else {
+                const parsed = parseDate(arg);
+                if (parsed) dateArgs.push(parsed);
+            }
+        }
+
+        if (dateArgs.length === 1) {
+            // Single date: show that entire day
+            dateFrom = new Date(dateArgs[0]);
+            dateFrom.setHours(0, 0, 0, 0);
+            dateTo = new Date(dateArgs[0]);
+            dateTo.setHours(23, 59, 59, 999);
+        } else if (dateArgs.length >= 2) {
+            // Date range
+            const sorted = [dateArgs[0], dateArgs[1]].sort((a, b) => a.getTime() - b.getTime());
+            dateFrom = new Date(sorted[0]);
+            dateFrom.setHours(0, 0, 0, 0);
+            dateTo = new Date(sorted[1]);
+            dateTo.setHours(23, 59, 59, 999);
+        }
+
+        // Build query for pengeluaran (debit)
+        let debitQuery = supabase.from('transactions').select(`
             amount, description, created_at, wallets ( name ), categories ( name )
-        `).eq('type', 'debit').order('created_at', { ascending: false }).limit(10);
+        `).eq('type', 'debit').order('created_at', { ascending: false }).limit(limit);
 
-        // Fetch 10 topup terakhir
-        const { data: credits } = await supabase.from('transactions').select(`
+        if (dateFrom) debitQuery = debitQuery.gte('created_at', dateFrom.toISOString());
+        if (dateTo) debitQuery = debitQuery.lte('created_at', dateTo.toISOString());
+
+        // Build query for pemasukan (credit)
+        let creditQuery = supabase.from('transactions').select(`
             amount, description, created_at, wallets ( name )
-        `).eq('type', 'credit').order('created_at', { ascending: false }).limit(10);
+        `).eq('type', 'credit').order('created_at', { ascending: false }).limit(limit);
 
-        let msg = '📋 **Riwayat Transaksi Terakhir**\n\n';
+        if (dateFrom) creditQuery = creditQuery.gte('created_at', dateFrom.toISOString());
+        if (dateTo) creditQuery = creditQuery.lte('created_at', dateTo.toISOString());
 
-        msg += '💸 **Pengeluaran (max 10)**\n';
+        const [{ data: debits }, { data: credits }] = await Promise.all([debitQuery, creditQuery]);
+
+        // Build header
+        let msg = '📋 **Riwayat Transaksi**\n';
+        if (dateFrom && dateTo) {
+            const fmtFrom = dateFrom.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', year: 'numeric' });
+            const fmtTo = dateTo.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', year: 'numeric' });
+            if (dateArgs.length === 1) {
+                msg += `📅 Tanggal: ${fmtFrom}\n`;
+            } else {
+                msg += `📅 Periode: ${fmtFrom} - ${fmtTo}\n`;
+            }
+        }
+        msg += `🔢 Maks ${limit} per tipe\n\n`;
+
+        // Pengeluaran section
+        msg += `💸 **Pengeluaran**\n`;
+        let totalDebit = 0;
         if (debits && debits.length > 0) {
             debits.forEach((t: any, i: number) => {
+                const amount = Number(t.amount);
+                totalDebit += amount;
                 const date = new Date(t.created_at).toLocaleDateString('id-ID', { day: '2-digit', month: 'short' });
                 const cat = t.categories?.name || '-';
-                msg += `${i+1}. ${date} | Rp ${Number(t.amount).toLocaleString('id-ID')} | ${t.description || '-'} [${cat}]\n`;
+                msg += `${i+1}. ${date} | Rp ${amount.toLocaleString('id-ID')} | ${t.description || '-'} [${cat}]\n`;
             });
         } else {
             msg += '_Belum ada pengeluaran._\n';
         }
 
-        msg += '\n💰 **Pemasukan/Topup (max 10)**\n';
+        // Pemasukan section
+        msg += `\n💰 **Pemasukan/Topup**\n`;
+        let totalCredit = 0;
         if (credits && credits.length > 0) {
             credits.forEach((t: any, i: number) => {
+                const amount = Number(t.amount);
+                totalCredit += amount;
                 const date = new Date(t.created_at).toLocaleDateString('id-ID', { day: '2-digit', month: 'short' });
                 const wallet = (t.wallets as any)?.name || '-';
-                msg += `${i+1}. ${date} | Rp ${Number(t.amount).toLocaleString('id-ID')} | ${t.description || '-'} → ${wallet}\n`;
+                msg += `${i+1}. ${date} | Rp ${amount.toLocaleString('id-ID')} | ${t.description || '-'} → ${wallet}\n`;
             });
         } else {
             msg += '_Belum ada pemasukan._\n';
         }
+
+        // Summary totals at the bottom
+        msg += '\n━━━━━━━━━━━━━━━━━━\n';
+        msg += `💰 Total Pemasukan: Rp ${totalCredit.toLocaleString('id-ID')}\n`;
+        msg += `💸 Total Pengeluaran: Rp ${totalDebit.toLocaleString('id-ID')}\n`;
+        msg += `📊 Selisih: Rp ${(totalCredit - totalDebit).toLocaleString('id-ID')}`;
 
         ctx.reply(msg, { parse_mode: 'Markdown' });
     } catch (err) {
