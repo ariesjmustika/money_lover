@@ -1,657 +1,1125 @@
-import { Telegraf } from 'telegraf';
+import { Telegraf, Context } from 'telegraf';
 import { supabase } from './supabase';
 
-const token = process.env.TELEGRAM_BOT_TOKEN || '';
 export const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN as string);
 
-// In-memory store: track message IDs sent by the bot per chat
-// key = chatId (string), value = Set of message_ids
-const botMessageLog = new Map<string, Set<number>>();
+// =====================================================================
+//  KONSTANTA
+// =====================================================================
 
-function logBotMessage(chatId: number | string, messageId: number) {
-    const key = String(chatId);
-    if (!botMessageLog.has(key)) botMessageLog.set(key, new Set());
-    botMessageLog.get(key)!.add(messageId);
+const TZ = 'Asia/Jakarta';
+const TZ_OFFSET = '+07:00';
+
+const DRAFT_TTL_MS = 15 * 60 * 1000;   // draft transaksi kadaluarsa 15 menit
+const AUTH_TTL_MS = 5 * 60 * 1000;     // cache izin user 5 menit
+const MAX_AMOUNT = 1_000_000_000_000;  // guard salah ketik
+const TG_MAX_LEN = 3800;               // limit aman pesan Telegram (real: 4096)
+
+// =====================================================================
+//  UTILITAS UMUM
+// =====================================================================
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Escape untuk parse_mode HTML. WAJIB dipakai untuk semua nilai dinamis. */
+function esc(v: unknown): string {
+  return String(v ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
-// Middleware 1: Database-backed Allowlist Security
-bot.use(async (ctx, next) => {
-    const userId = ctx.from?.id?.toString();
-    if (!userId) return;
+function formatRp(n: number | string): string {
+  return 'Rp ' + Number(n).toLocaleString('id-ID');
+}
 
-    try {
-        const { data: users, error } = await supabase.from('allowed_users').select('*');
-        if (error) throw error;
+function randomId(len = 6): string {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let s = '';
+  for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
 
-        // Auto-Bootstrap: Jika database kosong, user pertama jadi Admin
-        if (!users || users.length === 0) {
-            await supabase.from('allowed_users').insert({ telegram_id: userId, role: 'admin' });
-            if (ctx.message && 'text' in ctx.message) {
-                await ctx.reply('🎉 **Anda adalah pengguna pertama!**\nAnda otomatis diangkat menjadi **Admin**.\n\nGunakan `/adduser [ID_TELEGRAM]` untuk menambahkan anggota keluarga lain.', { parse_mode: 'Markdown' });
-            }
-            return next();
-        }
-
-        // Cek apakah user ada di database
-        const isAllowed = users.find(u => u.telegram_id === userId);
-        if (!isAllowed) {
-            if (ctx.message && 'text' in ctx.message) {
-                await ctx.reply(`❌ Akses ditolak.\n\nBot ini bersifat privat (Family Use Only).\nJika Anda adalah anggota keluarga, berikan ID ini ke Suami/Istri (Admin) agar ditambahkan:\n\n\`${userId}\``, { parse_mode: 'Markdown' });
-            }
-            return;
-        }
-
-        return next();
-    } catch (err) {
-        console.error('Auth Error:', err);
-        if (ctx.message && 'text' in ctx.message) {
-            await ctx.reply('Menunggu setup tabel `allowed_users` di Supabase...');
-        }
-        return;
+/** Pecah teks panjang jadi beberapa pesan tanpa memotong di tengah baris. */
+function chunkText(text: string, max = TG_MAX_LEN): string[] {
+  if (text.length <= max) return [text];
+  const out: string[] = [];
+  let buf = '';
+  for (const line of text.split('\n')) {
+    if (buf.length + line.length + 1 > max) {
+      if (buf) out.push(buf);
+      buf = line;
+    } else {
+      buf = buf ? buf + '\n' + line : line;
     }
+  }
+  if (buf) out.push(buf);
+  return out;
+}
+
+// =====================================================================
+//  TIMEZONE (Asia/Jakarta) — server biasanya UTC, jadi harus eksplisit
+// =====================================================================
+
+/** Tanggal "hari ini" menurut WIB, format YYYY-MM-DD. */
+function jakartaToday(): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(new Date());
+}
+
+/** Awal hari WIB → ISO string UTC. */
+function jakartaStartOfDay(y: number, m: number, d: number): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return new Date(`${y}-${p(m)}-${p(d)}T00:00:00.000${TZ_OFFSET}`).toISOString();
+}
+
+/** Akhir hari WIB → ISO string UTC. */
+function jakartaEndOfDay(y: number, m: number, d: number): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return new Date(`${y}-${p(m)}-${p(d)}T23:59:59.999${TZ_OFFSET}`).toISOString();
+}
+
+/** Awal bulan berjalan menurut WIB → ISO string UTC. */
+function jakartaStartOfMonth(): string {
+  const [y, m] = jakartaToday().split('-').map(Number);
+  return jakartaStartOfDay(y, m, 1);
+}
+
+/** Format tanggal singkat WIB, contoh "13 Agu". */
+function fmtShort(iso: string): string {
+  return new Date(iso).toLocaleDateString('id-ID', {
+    timeZone: TZ, day: '2-digit', month: 'short',
+  });
+}
+
+/** Format tanggal lengkap WIB, contoh "13 Agu 2026". */
+function fmtLong(iso: string): string {
+  return new Date(iso).toLocaleDateString('id-ID', {
+    timeZone: TZ, day: '2-digit', month: 'short', year: 'numeric',
+  });
+}
+
+/** YYYY-MM-DD menurut WIB (untuk CSV). */
+function fmtIsoDate(iso: string): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(new Date(iso));
+}
+
+/** Parse "dd/mm/yyyy" atau "dd-mm-yyyy" → {y, m, d} */
+function parseDateArg(str: string): { y: number; m: number; d: number } | null {
+  const mm = str.match(/^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$/);
+  if (!mm) return null;
+  const d = parseInt(mm[1], 10);
+  const m = parseInt(mm[2], 10);
+  const y = parseInt(mm[3], 10);
+  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+  return { y, m, d };
+}
+
+// =====================================================================
+//  PARSING NOMINAL
+//  Menangani: 50k · 15000 · 50.000 · 1,5juta · 1.5jt · 250rb
+// =====================================================================
+
+const AMOUNT_RE = /^(\d[\d.,]*)\s*(k|rb|ribu|jt|juta)?\s+(.+)$/i;
+
+function parseAmount(raw: string, unit?: string): number | null {
+  let s = raw;
+
+  if (/^\d{1,3}(\.\d{3})+$/.test(s)) {
+    s = s.replace(/\./g, '');          // 50.000 → separator ribuan
+  } else if (/^\d{1,3}(,\d{3})+$/.test(s)) {
+    s = s.replace(/,/g, '');           // 50,000 → separator ribuan
+  } else {
+    s = s.replace(',', '.');           // 1,5 → desimal
+  }
+
+  let n = parseFloat(s);
+  if (!isFinite(n) || n <= 0) return null;
+
+  const u = unit?.toLowerCase();
+  if (u === 'k' || u === 'rb' || u === 'ribu') n *= 1_000;
+  else if (u === 'jt' || u === 'juta') n *= 1_000_000;
+
+  n = Math.round(n);
+  if (n <= 0 || n > MAX_AMOUNT) return null;
+  return n;
+}
+
+// =====================================================================
+//  LOG PESAN BOT (dipakai /clearchat)
+//  Catatan: penyimpanan in-memory. Kalau di-deploy serverless dan proses
+//  sering restart, log ikut hilang → /clearchat hanya membersihkan pesan
+//  sejak restart terakhir. Untuk long-running process (bot.launch()) aman.
+// =====================================================================
+
+const botMessageLog = new Map<string, Set<number>>();
+
+function logBotMessage(chatId: number | string | undefined, messageId: number) {
+  if (chatId == null) return;
+  const key = String(chatId);
+  if (!botMessageLog.has(key)) botMessageLog.set(key, new Set());
+  const set = botMessageLog.get(key)!;
+  set.add(messageId);
+  // Batasi ukuran log biar tidak tumbuh selamanya
+  if (set.size > 1000) {
+    const sorted = Array.from(set).sort((a, b) => a - b);
+    sorted.slice(0, sorted.length - 1000).forEach((id) => set.delete(id));
+  }
+}
+
+/** Kirim pesan HTML + otomatis tercatat untuk /clearchat. */
+async function send(ctx: Context, text: string, extra: any = {}) {
+  const msg = await ctx.reply(text, { parse_mode: 'HTML', ...extra });
+  logBotMessage(ctx.chat?.id, msg.message_id);
+  return msg;
+}
+
+/** Kirim pesan panjang, otomatis dipecah. */
+async function sendLong(ctx: Context, text: string, extra: any = {}) {
+  const parts = chunkText(text);
+  for (let i = 0; i < parts.length; i++) {
+    await send(ctx, parts[i], i === parts.length - 1 ? extra : {});
+    if (i < parts.length - 1) await sleep(120);
+  }
+}
+
+// =====================================================================
+//  MIDDLEWARE: AUTH + CACHE
+// =====================================================================
+
+type AuthEntry = { role: string | null; expires: number };
+const authCache = new Map<string, AuthEntry>();
+
+function cacheAuth(userId: string, role: string | null) {
+  authCache.set(userId, { role, expires: Date.now() + AUTH_TTL_MS });
+}
+
+function invalidateAuth(userId?: string) {
+  if (userId) authCache.delete(userId);
+  else authCache.clear();
+}
+
+async function getRole(userId: string): Promise<string | null> {
+  const cached = authCache.get(userId);
+  if (cached && cached.expires > Date.now()) return cached.role;
+
+  const { data, error } = await supabase
+    .from('allowed_users')
+    .select('role')
+    .eq('telegram_id', userId)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  if (data) {
+    cacheAuth(userId, data.role);
+    return data.role;
+  }
+
+  // Belum terdaftar → cek kemungkinan bootstrap (tabel masih kosong)
+  const { data: rpc, error: rpcErr } = await supabase.rpc('bootstrap_first_user', {
+    p_telegram_id: userId,
+  });
+  if (rpcErr) throw rpcErr;
+
+  const role = (rpc as string | null) ?? null;
+  cacheAuth(userId, role);
+  return role;
+}
+
+bot.use(async (ctx, next) => {
+  const userId = ctx.from?.id?.toString();
+  if (!userId) return;
+
+  let role: string | null;
+  try {
+    role = await getRole(userId);
+  } catch (err) {
+    console.error('[auth]', err);
+    if (ctx.callbackQuery) await ctx.answerCbQuery('Gagal memverifikasi akses.').catch(() => {});
+    else if (ctx.message) await ctx.reply('⚠️ Gagal terhubung ke database. Coba lagi sebentar lagi.').catch(() => {});
+    return;
+  }
+
+  if (!role) {
+    const msg =
+      '❌ <b>Akses ditolak</b>\n\n' +
+      'Bot ini bersifat privat (family use only).\n' +
+      'Kalau kamu anggota keluarga, kirim ID ini ke Admin:\n\n' +
+      `<code>${esc(userId)}</code>`;
+    if (ctx.callbackQuery) await ctx.answerCbQuery('Akses ditolak.').catch(() => {});
+    else if (ctx.message) await ctx.reply(msg, { parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
+
+  (ctx.state as any).role = role;
+  return next();
 });
+
+// =====================================================================
+//  DRAFT STORE — pengganti "parsing state dari teks pesan"
+// =====================================================================
+
+interface Draft {
+  ownerId: string;
+  chatId: number;
+  kind: 'expense' | 'topup';
+  amount: number;
+  desc: string;
+  categoryId?: string;
+  categoryName?: string;
+  createdAt: number;
+}
+
+const drafts = new Map<string, Draft>();
+
+function createDraft(d: Omit<Draft, 'createdAt'>): string {
+  const id = randomId();
+  drafts.set(id, { ...d, createdAt: Date.now() });
+  return id;
+}
+
+function getDraft(id: string, ownerId: string): Draft | 'missing' | 'forbidden' {
+  const d = drafts.get(id);
+  if (!d || Date.now() - d.createdAt > DRAFT_TTL_MS) {
+    drafts.delete(id);
+    return 'missing';
+  }
+  if (d.ownerId !== ownerId) return 'forbidden';
+  return d;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, d] of drafts) {
+    if (now - d.createdAt > DRAFT_TTL_MS) drafts.delete(id);
+  }
+}, 5 * 60 * 1000).unref?.();
+
+// =====================================================================
+//  /start & /help
+// =====================================================================
 
 bot.start(async (ctx) => {
-  const sent = await ctx.reply(
-    'Halo! Saya asisten keuangan keluarga Anda. 👨‍👩‍👦\n\n' +
-    'Anda bisa mencatat pengeluaran langsung di chat ini, contoh:\n' +
-    '`50k makan siang` atau `15000 bensin`\n\n' +
-    'Ketik /help untuk info lebih lanjut.',
-    { parse_mode: 'Markdown' }
+  await send(
+    ctx,
+    '👋 <b>Halo! Saya asisten keuangan keluarga.</b>\n\n' +
+      'Cara paling cepat mencatat pengeluaran — ketik langsung di chat:\n' +
+      '<code>50k makan siang</code>\n' +
+      '<code>15000 bensin</code>\n\n' +
+      'Ketik /help untuk daftar lengkap perintah.'
   );
-  logBotMessage(ctx.chat.id, sent.message_id);
 });
+
+const HELP_TEXT =
+  '📖 <b>Panduan Bot Keuangan Keluarga</b>\n' +
+  '━━━━━━━━━━━━━━━━━━━━\n\n' +
+  '📝 <b>Catat Pengeluaran</b>\n' +
+  'Ketik langsung tanpa perintah apa pun:\n' +
+  '  • <code>50k makan siang</code>\n' +
+  '  • <code>15000 bensin</code>\n' +
+  '  • <code>1,5jt sewa kontrakan</code>\n' +
+  '  • <code>50.000 belanja bulanan</code>\n' +
+  '<i>Satuan yang dikenali: k · rb · ribu · jt · juta</i>\n\n' +
+  '💰 <b>Saldo &amp; Dompet</b>\n' +
+  '  /saldo — ringkasan saldo semua dompet\n' +
+  '  /topup — catat pemasukan / isi saldo\n' +
+  '  /dompet — daftar dompet\n' +
+  '  /tambahdompet <i>[nama]</i> — buat dompet baru\n\n' +
+  '📂 <b>Kategori</b>\n' +
+  '  /kategori — daftar kategori\n' +
+  '  /tambahkategori <i>[nama]</i> — buat kategori baru\n\n' +
+  '📊 <b>Laporan</b>\n' +
+  '  /riwayat — 10 transaksi terakhir\n' +
+  '     <code>/riwayat 20</code> — 20 terakhir\n' +
+  '     <code>/riwayat 10 13/08/2026</code> — satu hari\n' +
+  '     <code>/riwayat 10 01/08/2026 13/08/2026</code> — rentang\n' +
+  '  /laporan — rekap + export CSV\n\n' +
+  '⚙️ <b>Lainnya</b>\n' +
+  '  /clearchat — bersihkan pesan bot di chat ini\n' +
+  '  /myid — lihat ID Telegram kamu\n' +
+  '  /adduser <i>[ID]</i> — tambah anggota <i>(admin)</i>\n' +
+  '  /help — tampilkan panduan ini\n\n' +
+  '💡 <i>Tips: kalau nama kategori muncul di keterangan (misal "makan"), ' +
+  'bot langsung memilihkan kategorinya untuk kamu.</i>';
 
 bot.help(async (ctx) => {
-  const sent = await ctx.reply(
-    'Command yang tersedia:\n' +
-    '/saldo - Cek saldo saat ini\n' +
-    '/riwayat - Lihat riwayat transaksi (opsi: /riwayat [jumlah] [tgl\\_mulai] [tgl\\_akhir])\n' +
-    '/tambahdompet [nama] - Buat dompet baru\n' +
-    '/tambahkategori [nama] - Buat kategori baru\n' +
-    '/topup - Tambah saldo pemasukan\n' +
-    '/laporan - Laporan & Export CSV\n' +
-    '/clearchat - Hapus semua pesan bot di chat ini\n' +
-    '/adduser [ID] - Tambah anggota keluarga (Khusus Admin)'
-  );
-  logBotMessage(ctx.chat.id, sent.message_id);
+  await send(ctx, HELP_TEXT);
 });
 
-// --- /riwayat: Tampilkan riwayat transaksi dengan opsi jumlah & filter tanggal ---
-// Usage: /riwayat [n] [tanggal_mulai] [tanggal_akhir]
-// - n: jumlah transaksi per tipe (default 10)
-// - tanggal format: dd/mm/yyyy atau dd-mm-yyyy
-// Contoh: /riwayat 20
-//         /riwayat 5 01/08/2026
-//         /riwayat 15 01/08/2026 13/08/2026
-bot.command('riwayat', async (ctx) => {
-    try {
-        // Parse arguments
-        const args = ctx.message.text.split(/\s+/).slice(1);
-        let limit = 10;
-        let dateFrom: Date | null = null;
-        let dateTo: Date | null = null;
-
-        // Helper: parse dd/mm/yyyy or dd-mm-yyyy to Date
-        const parseDate = (str: string): Date | null => {
-            const m = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-            if (!m) return null;
-            const d = new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
-            return isNaN(d.getTime()) ? null : d;
-        };
-
-        // Classify each argument as number (limit) or date
-        const dateArgs: Date[] = [];
-        for (const arg of args) {
-            if (/^\d+$/.test(arg) && dateArgs.length === 0) {
-                // Pure number before any date → treat as limit
-                limit = Math.max(1, Math.min(parseInt(arg, 10), 50));
-            } else {
-                const parsed = parseDate(arg);
-                if (parsed) dateArgs.push(parsed);
-            }
-        }
-
-        if (dateArgs.length === 1) {
-            // Single date: show that entire day
-            dateFrom = new Date(dateArgs[0]);
-            dateFrom.setHours(0, 0, 0, 0);
-            dateTo = new Date(dateArgs[0]);
-            dateTo.setHours(23, 59, 59, 999);
-        } else if (dateArgs.length >= 2) {
-            // Date range
-            const sorted = [dateArgs[0], dateArgs[1]].sort((a, b) => a.getTime() - b.getTime());
-            dateFrom = new Date(sorted[0]);
-            dateFrom.setHours(0, 0, 0, 0);
-            dateTo = new Date(sorted[1]);
-            dateTo.setHours(23, 59, 59, 999);
-        }
-
-        // Build query for pengeluaran (debit)
-        let debitQuery = supabase.from('transactions').select(`
-            amount, description, created_at, wallets ( name ), categories ( name )
-        `).eq('type', 'debit').order('created_at', { ascending: false }).limit(limit);
-
-        if (dateFrom) debitQuery = debitQuery.gte('created_at', dateFrom.toISOString());
-        if (dateTo) debitQuery = debitQuery.lte('created_at', dateTo.toISOString());
-
-        // Build query for pemasukan (credit)
-        let creditQuery = supabase.from('transactions').select(`
-            amount, description, created_at, wallets ( name )
-        `).eq('type', 'credit').order('created_at', { ascending: false }).limit(limit);
-
-        if (dateFrom) creditQuery = creditQuery.gte('created_at', dateFrom.toISOString());
-        if (dateTo) creditQuery = creditQuery.lte('created_at', dateTo.toISOString());
-
-        const [{ data: debits }, { data: credits }] = await Promise.all([debitQuery, creditQuery]);
-
-        // Build header
-        let msg = '📋 **Riwayat Transaksi**\n';
-        if (dateFrom && dateTo) {
-            const fmtFrom = dateFrom.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', year: 'numeric' });
-            const fmtTo = dateTo.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', year: 'numeric' });
-            if (dateArgs.length === 1) {
-                msg += `📅 Tanggal: ${fmtFrom}\n`;
-            } else {
-                msg += `📅 Periode: ${fmtFrom} - ${fmtTo}\n`;
-            }
-        }
-        msg += `🔢 Maks ${limit} per tipe\n\n`;
-
-        // Pengeluaran section
-        msg += `💸 **Pengeluaran**\n`;
-        let totalDebit = 0;
-        if (debits && debits.length > 0) {
-            debits.forEach((t: any, i: number) => {
-                const amount = Number(t.amount);
-                totalDebit += amount;
-                const date = new Date(t.created_at).toLocaleDateString('id-ID', { day: '2-digit', month: 'short' });
-                const cat = t.categories?.name || '-';
-                msg += `${i+1}. ${date} | Rp ${amount.toLocaleString('id-ID')} | ${t.description || '-'} [${cat}]\n`;
-            });
-        } else {
-            msg += '_Belum ada pengeluaran._\n';
-        }
-
-        // Pemasukan section
-        msg += `\n💰 **Pemasukan/Topup**\n`;
-        let totalCredit = 0;
-        if (credits && credits.length > 0) {
-            credits.forEach((t: any, i: number) => {
-                const amount = Number(t.amount);
-                totalCredit += amount;
-                const date = new Date(t.created_at).toLocaleDateString('id-ID', { day: '2-digit', month: 'short' });
-                const wallet = (t.wallets as any)?.name || '-';
-                msg += `${i+1}. ${date} | Rp ${amount.toLocaleString('id-ID')} | ${t.description || '-'} → ${wallet}\n`;
-            });
-        } else {
-            msg += '_Belum ada pemasukan._\n';
-        }
-
-        // Summary totals at the bottom
-        msg += '\n━━━━━━━━━━━━━━━━━━\n';
-        msg += `💰 Total Pemasukan: Rp ${totalCredit.toLocaleString('id-ID')}\n`;
-        msg += `💸 Total Pengeluaran: Rp ${totalDebit.toLocaleString('id-ID')}\n`;
-        msg += `📊 Selisih: Rp ${(totalCredit - totalDebit).toLocaleString('id-ID')}`;
-
-        ctx.reply(msg, { parse_mode: 'Markdown' });
-    } catch (err) {
-        console.error(err);
-        ctx.reply('❌ Gagal mengambil riwayat.');
-    }
+bot.command('myid', async (ctx) => {
+  await send(ctx, `🆔 ID Telegram kamu:\n<code>${esc(ctx.from.id)}</code>`);
 });
 
-// --- /clearchat: Hapus pesan-pesan bot di chat ini (max 200 pesan terakhir) ---
-// Telegram hanya mengizinkan bot delete pesan dalam 48 jam terakhir.
-// Strategi: iterasi mundur dari message_id saat ini, coba hapus tiap pesan.
-bot.command('clearchat', async (ctx) => {
-    const chatId = ctx.chat.id;
-    const currentMsgId = ctx.message.message_id;
+/** Panggil sekali saat startup agar menu perintah muncul di UI Telegram. */
+export async function setupCommands() {
+  await bot.telegram.setMyCommands([
+    { command: 'saldo', description: '💰 Cek saldo semua dompet' },
+    { command: 'topup', description: '➕ Catat pemasukan / topup' },
+    { command: 'riwayat', description: '📋 Riwayat transaksi' },
+    { command: 'laporan', description: '📊 Laporan & export CSV' },
+    { command: 'kategori', description: '📂 Daftar kategori' },
+    { command: 'dompet', description: '👛 Daftar dompet' },
+    { command: 'tambahdompet', description: '🆕 Buat dompet baru' },
+    { command: 'tambahkategori', description: '🆕 Buat kategori baru' },
+    { command: 'clearchat', description: '🧹 Bersihkan pesan bot' },
+    { command: 'help', description: '📖 Panduan penggunaan' },
+  ]);
+}
 
-    // Hapus pesan /clearchat milik user dulu
-    try { await ctx.deleteMessage(); } catch (_) {}
+// =====================================================================
+//  DOMPET & KATEGORI
+// =====================================================================
 
-    const notif = await ctx.reply('🧹 Sedang membersihkan chat... Harap tunggu.');
-    const notifId = notif.message_id;
+async function createWallet(ctx: Context, name: string) {
+  const clean = name.trim().slice(0, 50);
+  if (!clean) return send(ctx, '⚠️ Nama dompet tidak boleh kosong.');
 
-    let deleted = 0;
-    let failed = 0;
+  const { error } = await supabase.from('wallets').insert({ name: clean, balance: 0 });
+  if (error) {
+    console.error('[createWallet]', error);
+    return send(ctx, '❌ Gagal membuat dompet.');
+  }
+  return send(ctx, `✅ Dompet <b>${esc(clean)}</b> berhasil dibuat.\nCek dengan /saldo`);
+}
 
-    // Iterasi mundur dari pesan sebelum /clearchat, sampai 200 pesan
-    const scanFrom = currentMsgId - 1;
-    const scanLimit = 200;
+async function createCategory(ctx: Context, name: string) {
+  const clean = name.trim().slice(0, 50);
+  if (!clean) return send(ctx, '⚠️ Nama kategori tidak boleh kosong.');
 
-    const deletePromises: Promise<void>[] = [];
-    for (let msgId = scanFrom; msgId > scanFrom - scanLimit && msgId > 0; msgId--) {
-        if (msgId === notifId) continue; // skip notif kita sendiri
-        deletePromises.push(
-            bot.telegram.deleteMessage(chatId, msgId)
-                .then(() => { deleted++; })
-                .catch(() => { failed++; }) // abaikan error (pesan bukan milik bot / sudah > 48j)
-        );
-    }
+  const { error } = await supabase.from('categories').insert({ name: clean });
+  if (error) {
+    console.error('[createCategory]', error);
+    return send(ctx, '❌ Gagal membuat kategori.');
+  }
+  return send(ctx, `✅ Kategori <b>${esc(clean)}</b> berhasil dibuat.`);
+}
 
-    await Promise.all(deletePromises);
+const PROMPT_WALLET = '👛 Ketik nama dompet baru yang ingin dibuat:';
+const PROMPT_CATEGORY = '📂 Ketik nama kategori pengeluaran baru (contoh: Makan & Minum):';
+const PROMPT_TOPUP = '💰 Berapa nominal pemasukan/topup-nya? (contoh: 500k atau 500000)';
 
-    // Update atau hapus notif setelah selesai
-    try {
-        await bot.telegram.editMessageText(
-            chatId, notifId, undefined,
-            `✅ Selesai! Berhasil menghapus *${deleted}* pesan.\n_(${failed} pesan tidak dapat dihapus — mungkin sudah > 48 jam atau bukan pesan bot)_`,
-            { parse_mode: 'Markdown' }
-        );
-        // Auto-hapus notif setelah 5 detik
-        setTimeout(async () => {
-            try { await bot.telegram.deleteMessage(chatId, notifId); } catch (_) {}
-        }, 5000);
-    } catch (_) {}
-});
-
-// --- /laporan: Menu utama laporan ---
-bot.command('laporan', async (ctx) => {
-    return ctx.reply('📊 Pilih jenis laporan:', {
-        reply_markup: {
-            inline_keyboard: [
-                [{ text: '📅 Bulan Ini (Chat)', callback_data: 'lap_chat_bulan' }, { text: '📅 Bulan Ini (CSV)', callback_data: 'lap_csv_bulan' }],
-                [{ text: '👤 Saya (Chat)', callback_data: 'lap_chat_saya' }, { text: '👤 Saya (CSV)', callback_data: 'lap_csv_saya' }],
-                [{ text: '📁 Semua (Chat)', callback_data: 'lap_chat_semua' }, { text: '📁 Semua (CSV)', callback_data: 'lap_csv_semua' }]
-            ]
-        }
-    });
-});
-
-
-bot.command('adduser', async (ctx) => {
-    const text = ctx.message.text.split(' ').slice(1).join(' ');
-    if (!text) {
-        return ctx.reply('⚠️ Format salah. Gunakan: `/adduser [ID_TELEGRAM]`', { parse_mode: 'Markdown' });
-    }
-
-    try {
-        const { data: currentUser } = await supabase.from('allowed_users').select('role').eq('telegram_id', ctx.from.id.toString()).single();
-        if (currentUser?.role !== 'admin') {
-            return ctx.reply('❌ Hanya admin yang dapat menambahkan user.');
-        }
-
-        const { error } = await supabase.from('allowed_users').insert({ telegram_id: text, role: 'member' });
-        if (error) throw error;
-        
-        ctx.reply(`✅ User dengan ID **${text}** berhasil ditambahkan! Mereka sekarang bisa menggunakan bot ini.`, { parse_mode: 'Markdown' });
-    } catch (err) {
-        console.error(err);
-        ctx.reply('❌ Gagal menambahkan user.');
-    }
+bot.command('tambahdompet', async (ctx) => {
+  const text = ctx.message.text.split(' ').slice(1).join(' ');
+  if (!text) return send(ctx, PROMPT_WALLET, { reply_markup: { force_reply: true, selective: true } });
+  await createWallet(ctx, text);
 });
 
 bot.command('tambahkategori', async (ctx) => {
-    const text = ctx.message.text.split(' ').slice(1).join(' ');
-    if (!text) {
-        return ctx.reply('📂 Silakan ketik nama kategori pengeluaran baru (contoh: Makan & Minum):', { 
-            reply_markup: { force_reply: true, selective: true } 
-        });
-    }
-    await createCategory(ctx, text);
+  const text = ctx.message.text.split(' ').slice(1).join(' ');
+  if (!text) return send(ctx, PROMPT_CATEGORY, { reply_markup: { force_reply: true, selective: true } });
+  await createCategory(ctx, text);
 });
+
+bot.command('dompet', async (ctx) => {
+  const { data, error } = await supabase.from('wallets').select('name, balance').order('name');
+  if (error) {
+    console.error('[dompet]', error);
+    return send(ctx, '❌ Gagal mengambil data dompet.');
+  }
+  if (!data?.length) return send(ctx, 'Belum ada dompet. Buat dengan /tambahdompet');
+
+  const lines = data.map((w: any) => `• <b>${esc(w.name)}</b> — ${formatRp(w.balance)}`);
+  return sendLong(ctx, '👛 <b>Daftar Dompet</b>\n\n' + lines.join('\n'));
+});
+
+bot.command('kategori', async (ctx) => {
+  const { data, error } = await supabase.from('categories').select('name, keywords').order('name');
+  if (error) {
+    console.error('[kategori]', error);
+    return send(ctx, '❌ Gagal mengambil data kategori.');
+  }
+  if (!data?.length) return send(ctx, 'Belum ada kategori. Buat dengan /tambahkategori');
+
+  const lines = data.map((c: any) => {
+    const kw = c.keywords ? ` <i>(${esc(c.keywords)})</i>` : '';
+    return `• ${esc(c.name)}${kw}`;
+  });
+  return sendLong(ctx, '📂 <b>Daftar Kategori</b>\n\n' + lines.join('\n'));
+});
+
+// =====================================================================
+//  /saldo
+// =====================================================================
+
+bot.command('saldo', async (ctx) => {
+  const { data: wallets, error } = await supabase
+    .from('wallets')
+    .select('name, balance')
+    .order('name');
+
+  if (error) {
+    console.error('[saldo]', error);
+    return send(ctx, '❌ Gagal mengambil data saldo.');
+  }
+  if (!wallets?.length) return send(ctx, 'Belum ada dompet terdaftar. Buat dengan /tambahdompet');
+
+  let total = 0;
+  const lines = wallets.map((w: any) => {
+    total += Number(w.balance);
+    const warn = Number(w.balance) < 0 ? ' ⚠️' : '';
+    return `💳 <b>${esc(w.name)}</b>: ${formatRp(w.balance)}${warn}`;
+  });
+
+  const msg =
+    '📊 <b>Ringkasan Saldo</b>\n' +
+    '━━━━━━━━━━━━━━━━━━\n' +
+    `💵 <b>Total: ${formatRp(total)}</b>\n\n` +
+    lines.join('\n');
+
+  return sendLong(ctx, msg);
+});
+
+// =====================================================================
+//  /topup
+// =====================================================================
 
 bot.command('topup', async (ctx) => {
-    return ctx.reply('💰 Berapa nominal pemasukan/topup-nya? (Ketik angka saja, contoh: 50000)', {
-        reply_markup: { force_reply: true, selective: true }
-    });
+  const arg = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  if (!arg) {
+    return send(ctx, PROMPT_TOPUP, { reply_markup: { force_reply: true, selective: true } });
+  }
+  const m = arg.match(/^(\d[\d.,]*)\s*(k|rb|ribu|jt|juta)?$/i);
+  const nominal = m ? parseAmount(m[1], m[2]) : null;
+  if (!nominal) return send(ctx, '⚠️ Nominal tidak valid. Contoh: <code>/topup 500k</code>');
+  return startTopup(ctx, nominal);
 });
 
-// Command untuk membuat dompet baru
-bot.command('tambahdompet', async (ctx) => {
-    const text = ctx.message.text.split(' ').slice(1).join(' ');
-    
-    // Jika hanya mengetik /tambahdompet tanpa parameter, minta input
-    if (!text) {
-        return ctx.reply('Silakan ketik nama dompet baru yang ingin dibuat:', { 
-            reply_markup: { force_reply: true, selective: true } 
-        });
-    }
+async function startTopup(ctx: Context, nominal: number) {
+  const { data: wallets, error } = await supabase.from('wallets').select('id, name').order('name');
+  if (error || !wallets?.length) {
+    return send(ctx, 'Belum ada dompet. Buat dulu dengan /tambahdompet');
+  }
 
-    // Jika sudah beserta nama (contoh: /tambahdompet Dompet Ayah)
-    await createWallet(ctx, text);
-});
+  const draftId = createDraft({
+    ownerId: String(ctx.from!.id),
+    chatId: ctx.chat!.id,
+    kind: 'topup',
+    amount: nominal,
+    desc: 'Topup saldo via Bot',
+  });
 
-async function createWallet(ctx: any, name: string) {
-    try {
-        const { error } = await supabase.from('wallets').insert({ name: name, balance: 0 });
-        if (error) throw error;
-        
-        ctx.reply(`✅ Dompet **"${name}"** berhasil dibuat!\nCoba ketik /saldo untuk melihatnya.`, { parse_mode: 'Markdown' });
-    } catch (err) {
-        console.error(err);
-        ctx.reply('❌ Terjadi kesalahan saat membuat dompet. Pastikan database Anda sudah siap.');
-    }
+  const buttons = wallets.map((w: any) => [
+    { text: w.name, callback_data: `tw_${draftId}_${w.id}` },
+  ]);
+  buttons.push([{ text: '✖️ Batal', callback_data: `cancel_${draftId}` }]);
+
+  return send(
+    ctx,
+    `💰 <b>Topup ${formatRp(nominal)}</b>\n\nPilih dompet tujuan:`,
+    { reply_markup: { inline_keyboard: buttons } }
+  );
 }
 
-async function createCategory(ctx: any, name: string) {
-    try {
-        const { error } = await supabase.from('categories').insert({ name: name });
-        if (error) throw error;
-        
-        ctx.reply(`✅ Kategori **"${name}"** berhasil dibuat!`, { parse_mode: 'Markdown' });
-    } catch (err) {
-        console.error(err);
-        ctx.reply('❌ Gagal membuat kategori.');
-    }
-}
+// =====================================================================
+//  /adduser
+// =====================================================================
 
-// Simple /saldo implementation stub
-bot.command('saldo', async (ctx) => {
-    try {
-        const { data: wallets, error } = await supabase.from('wallets').select('*');
-        if (error) throw error;
+bot.command('adduser', async (ctx) => {
+  if ((ctx.state as any).role !== 'admin') {
+    return send(ctx, '❌ Hanya admin yang dapat menambahkan anggota.');
+  }
 
-        if (!wallets || wallets.length === 0) {
-            return ctx.reply('Belum ada dompet yang terdaftar.');
-        }
+  const arg = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  if (!/^\d{5,15}$/.test(arg)) {
+    return send(
+      ctx,
+      '⚠️ Format salah.\nGunakan: <code>/adduser 123456789</code>\n\n' +
+        'Anggota bisa melihat ID-nya dengan mengetik /myid'
+    );
+  }
 
-        let total = 0;
-        let response = '📊 **Ringkasan Saldo Saat Ini**\n\n';
-        
-        for (const wallet of wallets) {
-            total += Number(wallet.balance);
-            response += `💰 **${wallet.name}:** Rp ${Number(wallet.balance).toLocaleString('id-ID')}\n`;
-        }
+  const { error } = await supabase
+    .from('allowed_users')
+    .insert({ telegram_id: arg, role: 'member' });
 
-        response = `Total Gabungan: Rp ${total.toLocaleString('id-ID')}\n\n` + response;
-        ctx.reply(response, { parse_mode: 'Markdown' });
-    } catch (err) {
-        console.error(err);
-        ctx.reply('Terjadi kesalahan saat mengambil data saldo.');
-    }
+  if (error) {
+    console.error('[adduser]', error);
+    const dup = (error as any).code === '23505';
+    return send(ctx, dup ? 'ℹ️ User ini sudah terdaftar.' : '❌ Gagal menambahkan user.');
+  }
+
+  invalidateAuth(arg);
+  return send(ctx, `✅ User <code>${esc(arg)}</code> berhasil ditambahkan.`);
 });
 
-// Basic fallback for natural language & handling ForceReply
-bot.on('text', async (ctx) => {
-    // Handle ForceReply
-    if (ctx.message.reply_to_message && 'text' in ctx.message.reply_to_message) {
-        const promptText = ctx.message.reply_to_message.text;
-        
-        // 1. Tambah Dompet
-        if (promptText === 'Silakan ketik nama dompet baru yang ingin dibuat:') {
-            await createWallet(ctx, ctx.message.text);
-            return;
-        }
+// =====================================================================
+//  /riwayat
+// =====================================================================
 
-        // 2. Tambah Kategori
-        if (promptText === '📂 Silakan ketik nama kategori pengeluaran baru (contoh: Makan & Minum):') {
-            await createCategory(ctx, ctx.message.text);
-            return;
-        }
+bot.command('riwayat', async (ctx) => {
+  try {
+    const args = ctx.message.text.split(/\s+/).slice(1);
+    let limit = 10;
+    const dateArgs: { y: number; m: number; d: number }[] = [];
 
-        // 3. Topup (Step 1 -> minta pilih dompet)
-        if (promptText === '💰 Berapa nominal pemasukan/topup-nya? (Ketik angka saja, contoh: 50000)') {
-            const nominalStr = ctx.message.text.replace(/[^0-9]/g, '');
-            if (!nominalStr) {
-                return ctx.reply('⚠️ Nominal tidak valid. Harus berupa angka.', { reply_markup: { force_reply: true, selective: true } });
-            }
-            const nominal = parseInt(nominalStr, 10);
-            
-            const { data: wallets, error } = await supabase.from('wallets').select('id, name');
-            if (error || !wallets || wallets.length === 0) {
-                return ctx.reply('Belum ada dompet. Buat dompet dulu dengan /tambahdompet');
-            }
-
-            const buttons = wallets.map(w => [{ text: w.name, callback_data: `topup_${nominal}_${w.id}` }]);
-            return ctx.reply(`Pilih dompet untuk menerima topup sebesar Rp ${nominal.toLocaleString('id-ID')}:`, {
-                reply_markup: { inline_keyboard: buttons }
-            });
-        }
+    for (const arg of args) {
+      const parsed = parseDateArg(arg);
+      if (parsed) {
+        dateArgs.push(parsed);
+      } else if (/^\d+$/.test(arg) && dateArgs.length === 0) {
+        limit = Math.max(1, Math.min(parseInt(arg, 10), 50));
+      }
     }
 
-    // Prevent catching commands
-    if (ctx.message.text.startsWith('/')) return;
-    
-    // NLP Expense Parser
-    // Match format like "50k makan siang" or "150rb belanja bulanan"
-    const match = ctx.message.text.match(/^(\d+(?:[.,]\d+)?)(k|rb|ribu|juta)?\s+(.+)$/i);
-    
-    if (match) {
-        let nominal = parseFloat(match[1].replace(/,/g, '.'));
-        const multiplier = match[2]?.toLowerCase();
-        
-        if (multiplier === 'k' || multiplier === 'rb' || multiplier === 'ribu') nominal *= 1000;
-        else if (multiplier === 'juta') nominal *= 1000000;
-        
-        const desc = match[3].trim();
+    let fromISO: string | null = null;
+    let toISO: string | null = null;
+    let periodLabel = '';
 
-        const { data: categories } = await supabase.from('categories').select('id, name');
-        let matchedCategory = null;
-        
-        if (categories && categories.length > 0) {
-            // Smart Match: Check if category name is in description
-            matchedCategory = categories.find(c => desc.toLowerCase().includes(c.name.toLowerCase()));
-        }
-
-        if (matchedCategory) {
-            // Category found! Proceed directly to wallet selection
-            return promptWalletSelection(ctx, nominal, desc, matchedCategory.id, matchedCategory.name);
-        } else {
-            // Ask for Category
-            if (!categories || categories.length === 0) {
-                return ctx.reply('Belum ada kategori. Buat dulu dengan /tambahkategori');
-            }
-            
-            // Limit to 10 categories for inline keyboard to avoid huge messages
-            const buttons = categories.slice(0, 10).map(c => [{ text: c.name, callback_data: `selcat_${c.id}` }]);
-            
-            return ctx.reply(`📝 Draft Pengeluaran\nNominal: ${nominal}\nKeterangan: ${desc}\n\nPilih Kategori:`, {
-                reply_markup: { inline_keyboard: buttons }
-            });
-        }
+    if (dateArgs.length === 1) {
+      const a = dateArgs[0];
+      fromISO = jakartaStartOfDay(a.y, a.m, a.d);
+      toISO = jakartaEndOfDay(a.y, a.m, a.d);
+      periodLabel = `📅 Tanggal: ${fmtLong(fromISO)}\n`;
+    } else if (dateArgs.length >= 2) {
+      const sorted = [dateArgs[0], dateArgs[1]].sort((x, y) =>
+        jakartaStartOfDay(x.y, x.m, x.d).localeCompare(jakartaStartOfDay(y.y, y.m, y.d))
+      );
+      fromISO = jakartaStartOfDay(sorted[0].y, sorted[0].m, sorted[0].d);
+      toISO = jakartaEndOfDay(sorted[1].y, sorted[1].m, sorted[1].d);
+      periodLabel = `📅 Periode: ${fmtLong(fromISO)} — ${fmtLong(toISO)}\n`;
     }
 
-    ctx.reply('Format tidak dikenali. Ketik dengan format: [nominal] [keterangan]\nContoh: 50k makan siang');
-});
+    const build = (type: 'debit' | 'credit') => {
+      let q = supabase
+        .from('transactions')
+        .select('amount, description, created_at, wallets ( name ), categories ( name )')
+        .eq('type', type)
+        .order('created_at', { ascending: false })
+        .limit(limit);
+      if (fromISO) q = q.gte('created_at', fromISO);
+      if (toISO) q = q.lte('created_at', toISO);
+      return q;
+    };
 
-// Helper for Wallet Prompt
-async function promptWalletSelection(ctx: any, nominal: number, desc: string, categoryId: string, categoryName: string) {
-    const { data: wallets } = await supabase.from('wallets').select('id, name');
-    if (!wallets || wallets.length === 0) return ctx.reply('Belum ada dompet.');
-    
-    const buttons = wallets.map(w => [{ text: w.name, callback_data: `selwal_${w.id}` }]);
-    
-    // Send or edit message
-    const text = `📝 Draft Pengeluaran\nNominal: ${nominal}\nKeterangan: ${desc}\nKategori ID: ${categoryId}\nKategori: ${categoryName}\n\nPilih Dompet Sumber Dana:`;
-    
-    if (ctx.callbackQuery) {
-        return ctx.editMessageText(text, { reply_markup: { inline_keyboard: buttons } });
+    const [debitRes, creditRes] = await Promise.all([build('debit'), build('credit')]);
+    if (debitRes.error) throw debitRes.error;
+    if (creditRes.error) throw creditRes.error;
+
+    const debits = debitRes.data ?? [];
+    const credits = creditRes.data ?? [];
+
+    let msg = '📋 <b>Riwayat Transaksi</b>\n' + periodLabel + `🔢 Maks ${limit} per tipe\n\n`;
+
+    let totalDebit = 0;
+    msg += '💸 <b>Pengeluaran</b>\n';
+    if (debits.length) {
+      debits.forEach((t: any, i: number) => {
+        totalDebit += Number(t.amount);
+        const cat = t.categories?.name || '-';
+        const wal = t.wallets?.name || '-';
+        msg +=
+          `${i + 1}. ${fmtShort(t.created_at)} · <b>${formatRp(t.amount)}</b>\n` +
+          `    ${esc(t.description || '-')} · <i>${esc(cat)}</i> · ${esc(wal)}\n`;
+      });
     } else {
-        return ctx.reply(text, { reply_markup: { inline_keyboard: buttons } });
+      msg += '<i>Belum ada pengeluaran.</i>\n';
     }
+
+    let totalCredit = 0;
+    msg += '\n💰 <b>Pemasukan</b>\n';
+    if (credits.length) {
+      credits.forEach((t: any, i: number) => {
+        totalCredit += Number(t.amount);
+        const wal = t.wallets?.name || '-';
+        msg +=
+          `${i + 1}. ${fmtShort(t.created_at)} · <b>${formatRp(t.amount)}</b>\n` +
+          `    ${esc(t.description || '-')} → ${esc(wal)}\n`;
+      });
+    } else {
+      msg += '<i>Belum ada pemasukan.</i>\n';
+    }
+
+    const diff = totalCredit - totalDebit;
+    msg +=
+      '\n━━━━━━━━━━━━━━━━━━\n' +
+      `💰 Total Pemasukan: ${formatRp(totalCredit)}\n` +
+      `💸 Total Pengeluaran: ${formatRp(totalDebit)}\n` +
+      `${diff >= 0 ? '📈' : '📉'} Selisih: ${formatRp(diff)}`;
+
+    await sendLong(ctx, msg);
+  } catch (err) {
+    console.error('[riwayat]', err);
+    await send(ctx, '❌ Gagal mengambil riwayat.');
+  }
+});
+
+// =====================================================================
+//  /laporan
+// =====================================================================
+
+bot.command('laporan', async (ctx) => {
+  return send(ctx, '📊 <b>Pilih jenis laporan:</b>', {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '📅 Bulan Ini (Chat)', callback_data: 'lap_chat_bulan' },
+          { text: '📅 Bulan Ini (CSV)', callback_data: 'lap_csv_bulan' },
+        ],
+        [
+          { text: '👤 Saya (Chat)', callback_data: 'lap_chat_saya' },
+          { text: '👤 Saya (CSV)', callback_data: 'lap_csv_saya' },
+        ],
+        [
+          { text: '📁 Semua (Chat)', callback_data: 'lap_chat_semua' },
+          { text: '📁 Semua (CSV)', callback_data: 'lap_csv_semua' },
+        ],
+      ],
+    },
+  });
+});
+
+// =====================================================================
+//  /clearchat — hanya menghapus pesan yang memang dikirim bot
+// =====================================================================
+
+bot.command('clearchat', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const key = String(chatId);
+
+  try { await ctx.deleteMessage(); } catch { /* ignore */ }
+
+  const ids = Array.from(botMessageLog.get(key) ?? []).sort((a, b) => b - a);
+  if (ids.length === 0) {
+    const m = await send(ctx, 'ℹ️ Tidak ada pesan bot yang tercatat untuk dihapus.');
+    setTimeout(() => bot.telegram.deleteMessage(chatId, m.message_id).catch(() => {}), 4000);
+    return;
+  }
+
+  const notif = await ctx.reply(`🧹 Membersihkan ${ids.length} pesan...`);
+  const notifId = notif.message_id;
+
+  let deleted = 0;
+  let failed = 0;
+  const BATCH = 8;
+
+  for (let i = 0; i < ids.length; i += BATCH) {
+    const slice = ids.slice(i, i + BATCH).filter((id) => id !== notifId);
+    const results = await Promise.allSettled(
+      slice.map((id) => bot.telegram.deleteMessage(chatId, id))
+    );
+    results.forEach((r, idx) => {
+      if (r.status === 'fulfilled') {
+        deleted++;
+        botMessageLog.get(key)?.delete(slice[idx]);
+      } else {
+        failed++;
+        // Kemungkinan besar > 48 jam → tidak akan pernah bisa dihapus lagi
+        botMessageLog.get(key)?.delete(slice[idx]);
+      }
+    });
+    if (i + BATCH < ids.length) await sleep(400); // hindari flood limit Telegram
+  }
+
+  try {
+    await bot.telegram.editMessageText(
+      chatId,
+      notifId,
+      undefined,
+      `✅ Selesai. <b>${deleted}</b> pesan dihapus.` +
+        (failed ? `\n<i>${failed} pesan tidak bisa dihapus (lebih dari 48 jam).</i>` : ''),
+      { parse_mode: 'HTML' }
+    );
+    setTimeout(() => bot.telegram.deleteMessage(chatId, notifId).catch(() => {}), 5000);
+  } catch { /* ignore */ }
+});
+
+// =====================================================================
+//  PENCOCOKAN KATEGORI OTOMATIS
+// =====================================================================
+
+function matchCategory(desc: string, categories: any[]): any | null {
+  const text = ' ' + desc.toLowerCase() + ' ';
+
+  const hits = (token: string) => {
+    const t = token.trim().toLowerCase();
+    if (t.length < 3) return false;
+    return new RegExp(`(^|[^a-z0-9])${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i').test(text);
+  };
+
+  // Prioritas 1: kata kunci manual (kolom `keywords`)
+  for (const c of categories) {
+    const kws = String(c.keywords || '').split(',').filter(Boolean);
+    if (kws.some(hits)) return c;
+  }
+
+  // Prioritas 2: token dari nama kategori ("Makan & Minum" → makan, minum)
+  for (const c of categories) {
+    const tokens = String(c.name).split(/[^a-zA-Z0-9]+/).filter(Boolean);
+    if (tokens.some(hits)) return c;
+  }
+
+  return null;
 }
 
-// Handle Callback Queries (Tombol Inline)
+// =====================================================================
+//  HANDLER TEKS (ForceReply + parser pengeluaran)
+// =====================================================================
+
+bot.on('text', async (ctx) => {
+  const text = ctx.message.text;
+
+  // --- ForceReply ---
+  const replyTo = ctx.message.reply_to_message;
+  if (replyTo && 'text' in replyTo) {
+    const prompt = replyTo.text;
+
+    if (prompt === PROMPT_WALLET) return createWallet(ctx, text);
+    if (prompt === PROMPT_CATEGORY) return createCategory(ctx, text);
+
+    if (prompt === PROMPT_TOPUP) {
+      const m = text.trim().match(/^(\d[\d.,]*)\s*(k|rb|ribu|jt|juta)?$/i);
+      const nominal = m ? parseAmount(m[1], m[2]) : null;
+      if (!nominal) {
+        return send(ctx, '⚠️ Nominal tidak valid. Ketik angka saja, contoh: 500000', {
+          reply_markup: { force_reply: true, selective: true },
+        });
+      }
+      return startTopup(ctx, nominal);
+    }
+  }
+
+  if (text.startsWith('/')) return;
+
+  // --- Parser pengeluaran ---
+  const match = text.match(AMOUNT_RE);
+  if (!match) {
+    return send(
+      ctx,
+      '🤔 Format tidak dikenali.\n\n' +
+        'Gunakan: <code>[nominal] [keterangan]</code>\n' +
+        'Contoh: <code>50k makan siang</code>\n\n' +
+        'Ketik /help untuk panduan lengkap.'
+    );
+  }
+
+  const nominal = parseAmount(match[1], match[2]);
+  if (!nominal) return send(ctx, '⚠️ Nominal tidak valid atau terlalu besar.');
+
+  const desc = match[3].trim().slice(0, 200);
+
+  const { data: categories, error } = await supabase
+    .from('categories')
+    .select('id, name, keywords')
+    .order('name');
+
+  if (error) {
+    console.error('[parse-expense]', error);
+    return send(ctx, '❌ Gagal mengambil daftar kategori.');
+  }
+  if (!categories?.length) {
+    return send(ctx, 'Belum ada kategori. Buat dulu dengan /tambahkategori');
+  }
+
+  const matched = matchCategory(desc, categories);
+
+  const draftId = createDraft({
+    ownerId: String(ctx.from.id),
+    chatId: ctx.chat.id,
+    kind: 'expense',
+    amount: nominal,
+    desc,
+    categoryId: matched?.id,
+    categoryName: matched?.name,
+  });
+
+  if (matched) return promptWallet(ctx, draftId, false);
+
+  const buttons = categories.slice(0, 12).map((c: any) => [
+    { text: c.name, callback_data: `sc_${draftId}_${c.id}` },
+  ]);
+  buttons.push([{ text: '✖️ Batal', callback_data: `cancel_${draftId}` }]);
+
+  return send(
+    ctx,
+    '📝 <b>Draft Pengeluaran</b>\n' +
+      `💸 ${formatRp(nominal)}\n` +
+      `📄 ${esc(desc)}\n\n` +
+      'Pilih kategori:',
+    { reply_markup: { inline_keyboard: buttons } }
+  );
+});
+
+// =====================================================================
+//  PROMPT PILIH DOMPET
+// =====================================================================
+
+async function promptWallet(ctx: Context, draftId: string, edit: boolean) {
+  const draft = drafts.get(draftId);
+  if (!draft) return send(ctx, '⏳ Draft sudah kadaluarsa. Silakan ulangi.');
+
+  const { data: wallets, error } = await supabase
+    .from('wallets')
+    .select('id, name, balance')
+    .order('name');
+
+  if (error || !wallets?.length) {
+    return send(ctx, 'Belum ada dompet. Buat dulu dengan /tambahdompet');
+  }
+
+  const buttons = wallets.map((w: any) => [
+    {
+      text: `${w.name} · ${formatRp(w.balance)}`,
+      callback_data: `sw_${draftId}_${w.id}`,
+    },
+  ]);
+  buttons.push([{ text: '✖️ Batal', callback_data: `cancel_${draftId}` }]);
+
+  const text =
+    '📝 <b>Draft Pengeluaran</b>\n' +
+    `💸 ${formatRp(draft.amount)}\n` +
+    `📄 ${esc(draft.desc)}\n` +
+    `📂 ${esc(draft.categoryName || '-')}\n\n` +
+    'Pilih dompet sumber dana:';
+
+  const markup = { reply_markup: { inline_keyboard: buttons }, parse_mode: 'HTML' as const };
+
+  if (edit) return ctx.editMessageText(text, markup);
+  return send(ctx, text, { reply_markup: markup.reply_markup });
+}
+
+// =====================================================================
+//  CALLBACK QUERY
+// =====================================================================
+
 bot.on('callback_query', async (ctx) => {
-    // @ts-ignore
-    const data = ctx.callbackQuery.data;
-    // @ts-ignore
-    const msgText = ctx.callbackQuery.message?.text || '';
-    if (!data) return;
+  const cq = ctx.callbackQuery as any;
+  const data: string | undefined = cq?.data;
+  const userId = String(ctx.from!.id);
 
-    // --- TOPUP FLOW ---
-    if (data.startsWith('topup_')) {
-        const parts = data.split('_');
-        const nominal = parseInt(parts[1], 10);
-        const walletId = parts[2];
+  if (!data) return ctx.answerCbQuery().catch(() => {});
 
-        try {
-            const { data: walletData } = await supabase.from('wallets').select('name, balance').eq('id', walletId).single();
-            if (!walletData) throw new Error('Dompet tidak ditemukan');
-
-            const newBalance = Number(walletData.balance) + nominal;
-
-            await supabase.from('wallets').update({ balance: newBalance }).eq('id', walletId);
-            await supabase.from('transactions').insert({
-                wallet_id: walletId,
-                amount: nominal,
-                type: 'credit',
-                description: 'Topup saldo via Bot',
-                created_by: ctx.from?.id?.toString()
-            });
-
-            await ctx.deleteMessage();
-            ctx.reply(`✅ **Topup berhasil!**\nRp ${nominal.toLocaleString('id-ID')} ditambahkan ke **${walletData.name}**.\n\nSaldo sekarang: Rp ${newBalance.toLocaleString('id-ID')}`, { parse_mode: 'Markdown' });
-        } catch (err) {
-            console.error(err);
-            ctx.reply('❌ Gagal melakukan topup.');
-        }
+  try {
+    // ---------- BATAL ----------
+    if (data.startsWith('cancel_')) {
+      const draftId = data.slice('cancel_'.length);
+      const d = getDraft(draftId, userId);
+      if (d === 'forbidden') return ctx.answerCbQuery('Ini bukan draft kamu.');
+      drafts.delete(draftId);
+      await ctx.answerCbQuery('Dibatalkan.');
+      try { await ctx.deleteMessage(); } catch { /* ignore */ }
+      return;
     }
 
-    // --- EXPENSE FLOW: SELECT CATEGORY ---
-    if (data.startsWith('selcat_')) {
-        const categoryId = data.replace('selcat_', '');
-        
-        // Parse data from message text
-        const nominalMatch = msgText.match(/Nominal: (\d+)/);
-        const descMatch = msgText.match(/Keterangan: (.+)/);
-        
-        if (nominalMatch && descMatch) {
-            const nominal = parseInt(nominalMatch[1], 10);
-            const desc = descMatch[1];
-            
-            // Get category name
-            const { data: catData } = await supabase.from('categories').select('name').eq('id', categoryId).single();
-            const catName = catData ? catData.name : 'Unknown';
-            
-            await promptWalletSelection(ctx, nominal, desc, categoryId, catName);
-        }
+    // ---------- TOPUP: PILIH DOMPET ----------
+    if (data.startsWith('tw_')) {
+      const [, draftId, walletId] = data.split('_');
+      const draft = getDraft(draftId, userId);
+      if (draft === 'missing') return ctx.answerCbQuery('⏳ Draft sudah kadaluarsa.', { show_alert: true });
+      if (draft === 'forbidden') return ctx.answerCbQuery('Ini bukan draft kamu.', { show_alert: true });
+
+      const { data: res, error } = await supabase.rpc('apply_transaction', {
+        p_wallet_id: walletId,
+        p_category_id: null,
+        p_amount: draft.amount,
+        p_type: 'credit',
+        p_description: draft.desc,
+        p_created_by: userId,
+      });
+
+      if (error) throw error;
+      const row = Array.isArray(res) ? res[0] : res;
+
+      drafts.delete(draftId);
+      await ctx.answerCbQuery('✅ Topup tercatat');
+      try { await ctx.deleteMessage(); } catch { /* ignore */ }
+
+      return send(
+        ctx,
+        '✅ <b>Topup Berhasil</b>\n' +
+          '━━━━━━━━━━━━━━━━━━\n' +
+          `💰 ${formatRp(draft.amount)}\n` +
+          `💳 ${esc(row.wallet_name)}\n\n` +
+          `Saldo sekarang: <b>${formatRp(row.new_balance)}</b>`
+      );
     }
 
-    // --- EXPENSE FLOW: SELECT WALLET (FINAL) ---
-    if (data.startsWith('selwal_')) {
-        const walletId = data.replace('selwal_', '');
-        
-        // Parse data from message text
-        const nominalMatch = msgText.match(/Nominal: (\d+)/);
-        const descMatch = msgText.match(/Keterangan: (.+)/);
-        const catIdMatch = msgText.match(/Kategori ID: ([a-zA-Z0-9-]+)/);
-        const catNameMatch = msgText.match(/Kategori: (.+)/);
-        
-        if (nominalMatch && descMatch && catIdMatch) {
-            const nominal = parseInt(nominalMatch[1], 10);
-            const desc = descMatch[1];
-            const categoryId = catIdMatch[1];
-            const categoryName = catNameMatch ? catNameMatch[1] : '';
+    // ---------- PENGELUARAN: PILIH KATEGORI ----------
+    if (data.startsWith('sc_')) {
+      const [, draftId, categoryId] = data.split('_');
+      const draft = getDraft(draftId, userId);
+      if (draft === 'missing') return ctx.answerCbQuery('⏳ Draft sudah kadaluarsa.', { show_alert: true });
+      if (draft === 'forbidden') return ctx.answerCbQuery('Ini bukan draft kamu.', { show_alert: true });
 
-            try {
-                const { data: walletData } = await supabase.from('wallets').select('name, balance').eq('id', walletId).single();
-                if (!walletData) throw new Error('Dompet tidak ditemukan');
-    
-                const newBalance = Number(walletData.balance) - nominal;
-    
-                // 1. Update Balance
-                await supabase.from('wallets').update({ balance: newBalance }).eq('id', walletId);
-                
-                // 2. Insert Transaction
-                await supabase.from('transactions').insert({
-                    wallet_id: walletId,
-                    category_id: categoryId,
-                    amount: nominal,
-                    type: 'debit',
-                    description: desc,
-                    created_by: ctx.from?.id?.toString()
-                });
-    
-                await ctx.deleteMessage();
-                ctx.reply(`✅ **Pengeluaran Dicatat!**\n\n💸 Rp ${nominal.toLocaleString('id-ID')}\n📝 ${desc}\n📂 Kategori: ${categoryName}\n💳 Sumber: ${walletData.name}\n\nSisa Saldo ${walletData.name}: Rp ${newBalance.toLocaleString('id-ID')}`, { parse_mode: 'Markdown' });
-            } catch (err) {
-                console.error(err);
-                ctx.reply('❌ Gagal mencatat pengeluaran.');
-            }
-        }
+      const { data: cat } = await supabase
+        .from('categories')
+        .select('name')
+        .eq('id', categoryId)
+        .maybeSingle();
+
+      draft.categoryId = categoryId;
+      draft.categoryName = cat?.name ?? 'Tanpa Kategori';
+
+      await ctx.answerCbQuery();
+      return promptWallet(ctx, draftId, true);
     }
 
-    // --- REPORT FLOW ---
+    // ---------- PENGELUARAN: PILIH DOMPET (FINAL) ----------
+    if (data.startsWith('sw_')) {
+      const [, draftId, walletId] = data.split('_');
+      const draft = getDraft(draftId, userId);
+      if (draft === 'missing') return ctx.answerCbQuery('⏳ Draft sudah kadaluarsa.', { show_alert: true });
+      if (draft === 'forbidden') return ctx.answerCbQuery('Ini bukan draft kamu.', { show_alert: true });
+
+      const { data: res, error } = await supabase.rpc('apply_transaction', {
+        p_wallet_id: walletId,
+        p_category_id: draft.categoryId ?? null,
+        p_amount: draft.amount,
+        p_type: 'debit',
+        p_description: draft.desc,
+        p_created_by: userId,
+      });
+
+      if (error) throw error;
+      const row = Array.isArray(res) ? res[0] : res;
+
+      drafts.delete(draftId);
+      await ctx.answerCbQuery('✅ Tercatat');
+      try { await ctx.deleteMessage(); } catch { /* ignore */ }
+
+      const warn =
+        Number(row.new_balance) < 0
+          ? '\n\n⚠️ <b>Saldo dompet ini sudah minus.</b>'
+          : '';
+
+      return send(
+        ctx,
+        '✅ <b>Pengeluaran Dicatat</b>\n' +
+          '━━━━━━━━━━━━━━━━━━\n' +
+          `💸 ${formatRp(draft.amount)}\n` +
+          `📄 ${esc(draft.desc)}\n` +
+          `📂 ${esc(draft.categoryName || '-')}\n` +
+          `💳 ${esc(row.wallet_name)}\n\n` +
+          `Sisa saldo: <b>${formatRp(row.new_balance)}</b>${warn}`
+      );
+    }
+
+    // ---------- LAPORAN ----------
     if (data.startsWith('lap_')) {
-        const parts = data.replace('lap_', '').split('_');
-        const outputMode = parts[0]; // 'chat' or 'csv'
-        const filterType = parts[1]; // 'bulan', 'saya', 'semua'
+      const [outputMode, filterType] = data.replace('lap_', '').split('_');
 
-        let query = supabase.from('transactions').select(`
-            id, amount, type, description, created_at, created_by,
-            wallets ( name ),
-            categories ( name )
-        `).order('created_at', { ascending: false });
+      let query = supabase
+        .from('transactions')
+        .select('id, amount, type, description, created_at, created_by, wallets ( name ), categories ( name )')
+        .order('created_at', { ascending: false });
 
-        if (filterType === 'bulan') {
-            const startOfMonth = new Date();
-            startOfMonth.setDate(1);
-            startOfMonth.setHours(0,0,0,0);
-            query = query.gte('created_at', startOfMonth.toISOString());
-        } else if (filterType === 'saya') {
-            query = query.eq('created_by', ctx.from?.id?.toString());
+      if (filterType === 'bulan') {
+        query = query.gte('created_at', jakartaStartOfMonth());
+      } else if (filterType === 'saya') {
+        query = query.eq('created_by', userId);
+      }
+
+      const { data: txs, error } = await query;
+      if (error) throw error;
+
+      if (!txs?.length) {
+        return ctx.answerCbQuery('Tidak ada data untuk filter ini.', { show_alert: true });
+      }
+
+      await ctx.answerCbQuery('Memproses...');
+
+      const debits = txs.filter((t: any) => t.type === 'debit');
+      const credits = txs.filter((t: any) => t.type === 'credit');
+      const totalDebit = debits.reduce((s: number, t: any) => s + Number(t.amount), 0);
+      const totalCredit = credits.reduce((s: number, t: any) => s + Number(t.amount), 0);
+
+      const title =
+        filterType === 'bulan' ? 'Bulan Ini' : filterType === 'saya' ? 'Transaksi Saya' : 'Semua Data';
+
+      if (outputMode === 'chat') {
+        // Rekap per kategori
+        const byCat = new Map<string, number>();
+        for (const t of debits as any[]) {
+          const name = t.categories?.name || 'Tanpa Kategori';
+          byCat.set(name, (byCat.get(name) ?? 0) + Number(t.amount));
+        }
+        const catLines = Array.from(byCat.entries())
+          .sort((a, b) => b[1] - a[1])
+          .map(([name, sum]) => {
+            const pct = totalDebit ? Math.round((sum / totalDebit) * 100) : 0;
+            return `  • ${esc(name)}: ${formatRp(sum)} <i>(${pct}%)</i>`;
+          });
+
+        let msg =
+          `📊 <b>Laporan ${esc(title)}</b>\n` +
+          '━━━━━━━━━━━━━━━━━━\n' +
+          `💰 Pemasukan: ${formatRp(totalCredit)}\n` +
+          `💸 Pengeluaran: ${formatRp(totalDebit)}\n` +
+          `${totalCredit - totalDebit >= 0 ? '📈' : '📉'} Selisih: ${formatRp(totalCredit - totalDebit)}\n` +
+          `🧾 Jumlah transaksi: ${txs.length}\n`;
+
+        if (catLines.length) {
+          msg += '\n📂 <b>Pengeluaran per Kategori</b>\n' + catLines.join('\n') + '\n';
         }
 
-        try {
-            const { data: txs, error } = await query;
-            if (error) throw error;
-
-            if (!txs || txs.length === 0) {
-                return ctx.answerCbQuery('Tidak ada data transaksi untuk filter ini.');
-            }
-
-            if (outputMode === 'chat') {
-                // --- OUTPUT DI TELEGRAM ---
-                const debits = txs.filter((t: any) => t.type === 'debit');
-                const credits = txs.filter((t: any) => t.type === 'credit');
-                const totalDebit = debits.reduce((sum: number, t: any) => sum + Number(t.amount), 0);
-                const totalCredit = credits.reduce((sum: number, t: any) => sum + Number(t.amount), 0);
-
-                let msg = `📊 **Laporan ${filterType === 'bulan' ? 'Bulan Ini' : filterType === 'saya' ? 'Transaksi Saya' : 'Semua Data'}**\n\n`;
-                msg += `Total Pemasukan: Rp ${totalCredit.toLocaleString('id-ID')}\n`;
-                msg += `Total Pengeluaran: Rp ${totalDebit.toLocaleString('id-ID')}\n`;
-                msg += `Selisih: Rp ${(totalCredit - totalDebit).toLocaleString('id-ID')}\n\n`;
-
-                if (debits.length > 0) {
-                    msg += '💸 **Pengeluaran:**\n';
-                    debits.slice(0, 15).forEach((t: any, i: number) => {
-                        const date = new Date(t.created_at).toLocaleDateString('id-ID', { day: '2-digit', month: 'short' });
-                        const cat = (t.categories as any)?.name || '-';
-                        msg += `${i+1}. ${date} | Rp ${Number(t.amount).toLocaleString('id-ID')} | ${t.description || '-'} [${cat}]\n`;
-                    });
-                    if (debits.length > 15) msg += `_...dan ${debits.length - 15} lainnya_\n`;
-                }
-
-                if (credits.length > 0) {
-                    msg += '\n💰 **Pemasukan:**\n';
-                    credits.slice(0, 15).forEach((t: any, i: number) => {
-                        const date = new Date(t.created_at).toLocaleDateString('id-ID', { day: '2-digit', month: 'short' });
-                        msg += `${i+1}. ${date} | Rp ${Number(t.amount).toLocaleString('id-ID')} | ${t.description || '-'}\n`;
-                    });
-                    if (credits.length > 15) msg += `_...dan ${credits.length - 15} lainnya_\n`;
-                }
-
-                await ctx.deleteMessage();
-                return ctx.reply(msg, { parse_mode: 'Markdown' });
-
-            } else {
-                // --- OUTPUT CSV ---
-                const header = 'Tanggal,Dompet,Kategori,Tipe,Nominal,Keterangan,Pencatat\n';
-                const rows = txs.map((t: any) => {
-                    const date = new Date(t.created_at).toISOString().split('T')[0];
-                    const wallet = (t.wallets as any)?.name || '-';
-                    const category = (t.categories as any)?.name || '-';
-                    const desc = `"${(t.description || '').replace(/"/g, '""')}"`;
-                    const creator = t.created_by || '-';
-                    return `${date},${wallet},${category},${t.type},${t.amount},${desc},${creator}`;
-                });
-                
-                const csv = header + rows.join('\n');
-                const buffer = Buffer.from(csv, 'utf-8');
-
-                await ctx.deleteMessage();
-                return ctx.replyWithDocument(
-                    { source: buffer, filename: `Laporan_${filterType}.csv` },
-                    { caption: `📊 Berhasil di-export!\nTotal: ${txs.length} transaksi.` }
-                );
-            }
-        } catch (err) {
-            console.error(err);
-            ctx.reply('❌ Gagal memproses laporan.');
+        if (debits.length) {
+          msg += '\n💸 <b>Pengeluaran Terakhir</b>\n';
+          debits.slice(0, 15).forEach((t: any, i: number) => {
+            const cat = t.categories?.name || '-';
+            msg += `${i + 1}. ${fmtShort(t.created_at)} · ${formatRp(t.amount)} · ${esc(t.description || '-')} <i>[${esc(cat)}]</i>\n`;
+          });
+          if (debits.length > 15) msg += `<i>...dan ${debits.length - 15} lainnya</i>\n`;
         }
+
+        if (credits.length) {
+          msg += '\n💰 <b>Pemasukan Terakhir</b>\n';
+          credits.slice(0, 15).forEach((t: any, i: number) => {
+            msg += `${i + 1}. ${fmtShort(t.created_at)} · ${formatRp(t.amount)} · ${esc(t.description || '-')}\n`;
+          });
+          if (credits.length > 15) msg += `<i>...dan ${credits.length - 15} lainnya</i>\n`;
+        }
+
+        try { await ctx.deleteMessage(); } catch { /* ignore */ }
+        return sendLong(ctx, msg);
+      }
+
+      // ---------- CSV ----------
+      const q = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+      const header = 'Tanggal,Dompet,Kategori,Tipe,Nominal,Keterangan,Pencatat\n';
+      const rows = (txs as any[]).map((t) =>
+        [
+          fmtIsoDate(t.created_at),
+          q(t.wallets?.name || '-'),
+          q(t.categories?.name || '-'),
+          t.type,
+          t.amount,
+          q(t.description || ''),
+          q(t.created_by || '-'),
+        ].join(',')
+      );
+
+      // BOM agar Excel membaca UTF-8 dengan benar
+      const buffer = Buffer.from('\uFEFF' + header + rows.join('\n'), 'utf-8');
+
+      try { await ctx.deleteMessage(); } catch { /* ignore */ }
+      const doc = await ctx.replyWithDocument(
+        { source: buffer, filename: `Laporan_${filterType}_${jakartaToday()}.csv` },
+        { caption: `📊 Export berhasil — ${txs.length} transaksi.` }
+      );
+      logBotMessage(ctx.chat?.id, doc.message_id);
+      return;
     }
+
+    return ctx.answerCbQuery();
+  } catch (err: any) {
+    console.error('[callback]', err);
+
+    const raw = String(err?.message || '');
+    let userMsg = '❌ Terjadi kesalahan. Coba lagi.';
+    if (raw.includes('WALLET_NOT_FOUND')) userMsg = '❌ Dompet tidak ditemukan.';
+    else if (raw.includes('INVALID_AMOUNT')) userMsg = '❌ Nominal tidak valid.';
+
+    await ctx.answerCbQuery(userMsg, { show_alert: true }).catch(() => {});
+  }
+});
+
+// =====================================================================
+//  GLOBAL ERROR HANDLER
+// =====================================================================
+
+bot.catch((err, ctx) => {
+  console.error(`[bot.catch] update ${ctx.updateType}:`, err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
 });
