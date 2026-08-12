@@ -4,6 +4,16 @@ import { supabase } from './supabase';
 const token = process.env.TELEGRAM_BOT_TOKEN || '';
 export const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN as string);
 
+// In-memory store: track message IDs sent by the bot per chat
+// key = chatId (string), value = Set of message_ids
+const botMessageLog = new Map<string, Set<number>>();
+
+function logBotMessage(chatId: number | string, messageId: number) {
+    const key = String(chatId);
+    if (!botMessageLog.has(key)) botMessageLog.set(key, new Set());
+    botMessageLog.get(key)!.add(messageId);
+}
+
 // Middleware 1: Database-backed Allowlist Security
 bot.use(async (ctx, next) => {
     const userId = ctx.from?.id?.toString();
@@ -41,18 +51,19 @@ bot.use(async (ctx, next) => {
     }
 });
 
-bot.start((ctx) => {
-  ctx.reply(
+bot.start(async (ctx) => {
+  const sent = await ctx.reply(
     'Halo! Saya asisten keuangan keluarga Anda. 👨‍👩‍👦\n\n' +
     'Anda bisa mencatat pengeluaran langsung di chat ini, contoh:\n' +
     '`50k makan siang` atau `15000 bensin`\n\n' +
     'Ketik /help untuk info lebih lanjut.',
     { parse_mode: 'Markdown' }
   );
+  logBotMessage(ctx.chat.id, sent.message_id);
 });
 
-bot.help((ctx) => {
-  ctx.reply(
+bot.help(async (ctx) => {
+  const sent = await ctx.reply(
     'Command yang tersedia:\n' +
     '/saldo - Cek saldo saat ini\n' +
     '/riwayat - Lihat riwayat transaksi (opsi: /riwayat [jumlah] [tgl\\_mulai] [tgl\\_akhir])\n' +
@@ -60,8 +71,10 @@ bot.help((ctx) => {
     '/tambahkategori [nama] - Buat kategori baru\n' +
     '/topup - Tambah saldo pemasukan\n' +
     '/laporan - Laporan & Export CSV\n' +
+    '/clearchat - Hapus semua pesan bot di chat ini\n' +
     '/adduser [ID] - Tambah anggota keluarga (Khusus Admin)'
   );
+  logBotMessage(ctx.chat.id, sent.message_id);
 });
 
 // --- /riwayat: Tampilkan riwayat transaksi dengan opsi jumlah & filter tanggal ---
@@ -188,6 +201,52 @@ bot.command('riwayat', async (ctx) => {
     }
 });
 
+// --- /clearchat: Hapus pesan-pesan bot di chat ini (max 200 pesan terakhir) ---
+// Telegram hanya mengizinkan bot delete pesan dalam 48 jam terakhir.
+// Strategi: iterasi mundur dari message_id saat ini, coba hapus tiap pesan.
+bot.command('clearchat', async (ctx) => {
+    const chatId = ctx.chat.id;
+    const currentMsgId = ctx.message.message_id;
+
+    // Hapus pesan /clearchat milik user dulu
+    try { await ctx.deleteMessage(); } catch (_) {}
+
+    const notif = await ctx.reply('🧹 Sedang membersihkan chat... Harap tunggu.');
+    const notifId = notif.message_id;
+
+    let deleted = 0;
+    let failed = 0;
+
+    // Iterasi mundur dari pesan sebelum /clearchat, sampai 200 pesan
+    const scanFrom = currentMsgId - 1;
+    const scanLimit = 200;
+
+    const deletePromises: Promise<void>[] = [];
+    for (let msgId = scanFrom; msgId > scanFrom - scanLimit && msgId > 0; msgId--) {
+        if (msgId === notifId) continue; // skip notif kita sendiri
+        deletePromises.push(
+            bot.telegram.deleteMessage(chatId, msgId)
+                .then(() => { deleted++; })
+                .catch(() => { failed++; }) // abaikan error (pesan bukan milik bot / sudah > 48j)
+        );
+    }
+
+    await Promise.all(deletePromises);
+
+    // Update atau hapus notif setelah selesai
+    try {
+        await bot.telegram.editMessageText(
+            chatId, notifId, undefined,
+            `✅ Selesai! Berhasil menghapus *${deleted}* pesan.\n_(${failed} pesan tidak dapat dihapus — mungkin sudah > 48 jam atau bukan pesan bot)_`,
+            { parse_mode: 'Markdown' }
+        );
+        // Auto-hapus notif setelah 5 detik
+        setTimeout(async () => {
+            try { await bot.telegram.deleteMessage(chatId, notifId); } catch (_) {}
+        }, 5000);
+    } catch (_) {}
+});
+
 // --- /laporan: Menu utama laporan ---
 bot.command('laporan', async (ctx) => {
     return ctx.reply('📊 Pilih jenis laporan:', {
@@ -200,6 +259,7 @@ bot.command('laporan', async (ctx) => {
         }
     });
 });
+
 
 bot.command('adduser', async (ctx) => {
     const text = ctx.message.text.split(' ').slice(1).join(' ');
