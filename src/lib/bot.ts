@@ -669,45 +669,46 @@ bot.command('laporan', async (ctx) => {
 });
 
 // =====================================================================
-//  /clearchat — hanya menghapus pesan yang memang dikirim bot
+//  /clearchat — brute-force scan mundur dari message_id sekarang
+//  (TIDAK bergantung ke in-memory log, jadi aman meski serverless/
+//   proses sering restart)
 // =====================================================================
+
+const CLEARCHAT_SCAN_LIMIT = 200; // jumlah message_id ke belakang yang dicoba
+const CLEARCHAT_BATCH = 8;        // hindari flood limit Telegram
 
 bot.command('clearchat', async (ctx) => {
   const chatId = ctx.chat.id;
-  const key = String(chatId);
+  const currentMsgId = ctx.message.message_id;
 
+  // Hapus pesan perintah /clearchat itu sendiri
   try { await ctx.deleteMessage(); } catch { /* ignore */ }
 
-  const ids = Array.from(botMessageLog.get(key) ?? []).sort((a, b) => b - a);
-  if (ids.length === 0) {
-    const m = await send(ctx, 'ℹ️ Tidak ada pesan bot yang tercatat untuk dihapus.');
-    setTimeout(() => bot.telegram.deleteMessage(chatId, m.message_id).catch(() => {}), 4000);
-    return;
-  }
-
-  const notif = await ctx.reply(`🧹 Membersihkan ${ids.length} pesan...`);
+  const notif = await ctx.reply('🧹 Sedang membersihkan chat... Harap tunggu.');
   const notifId = notif.message_id;
+  logBotMessage(chatId, notifId); // tetap dicatat untuk konsistensi, walau tak dipakai untuk deteksi lagi
 
   let deleted = 0;
   let failed = 0;
-  const BATCH = 8;
 
-  for (let i = 0; i < ids.length; i += BATCH) {
-    const slice = ids.slice(i, i + BATCH).filter((id) => id !== notifId);
+  // Scan mundur dari pesan sebelum /clearchat
+  const scanFrom = currentMsgId - 1;
+  const ids: number[] = [];
+  for (let id = scanFrom; id > scanFrom - CLEARCHAT_SCAN_LIMIT && id > 0; id--) {
+    if (id === notifId) continue; // jangan hapus notif kita sendiri saat masih diproses
+    ids.push(id);
+  }
+
+  for (let i = 0; i < ids.length; i += CLEARCHAT_BATCH) {
+    const slice = ids.slice(i, i + CLEARCHAT_BATCH);
     const results = await Promise.allSettled(
       slice.map((id) => bot.telegram.deleteMessage(chatId, id))
     );
-    results.forEach((r, idx) => {
-      if (r.status === 'fulfilled') {
-        deleted++;
-        botMessageLog.get(key)?.delete(slice[idx]);
-      } else {
-        failed++;
-        // Kemungkinan besar > 48 jam → tidak akan pernah bisa dihapus lagi
-        botMessageLog.get(key)?.delete(slice[idx]);
-      }
+    results.forEach((r) => {
+      if (r.status === 'fulfilled') deleted++;
+      else failed++; // wajar: pesan user tidak bisa dihapus bot biasa, atau sudah > 48 jam
     });
-    if (i + BATCH < ids.length) await sleep(400); // hindari flood limit Telegram
+    if (i + CLEARCHAT_BATCH < ids.length) await sleep(400);
   }
 
   try {
@@ -716,7 +717,7 @@ bot.command('clearchat', async (ctx) => {
       notifId,
       undefined,
       `✅ Selesai. <b>${deleted}</b> pesan dihapus.` +
-        (failed ? `\n<i>${failed} pesan tidak bisa dihapus (lebih dari 48 jam).</i>` : ''),
+        (failed ? `\n<i>${failed} pesan lain tidak bisa dihapus (bukan pesan bot / lebih dari 48 jam).</i>` : ''),
       { parse_mode: 'HTML' }
     );
     setTimeout(() => bot.telegram.deleteMessage(chatId, notifId).catch(() => {}), 5000);
