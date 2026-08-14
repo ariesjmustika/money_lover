@@ -329,10 +329,12 @@ const HELP_TEXT =
   '  /kategori — daftar kategori\n' +
   '  /tambahkategori <i>[nama]</i> — buat kategori baru\n\n' +
   '📊 <b>Laporan</b>\n' +
-  '  /riwayat — 10 transaksi terakhir\n' +
+  '  /riwayat — 10 transaksi terakhir (semua dompet)\n' +
   '     <code>/riwayat 20</code> — 20 terakhir\n' +
   '     <code>/riwayat 10 13/08/2026</code> — satu hari\n' +
   '     <code>/riwayat 10 01/08/2026 13/08/2026</code> — rentang\n' +
+  '     <code>/riwayat 10 BCA</code> — filter dompet BCA\n' +
+  '     <code>/riwayat 10 01/08/2026 13/08/2026 BCA</code> — rentang + dompet\n' +
   '  /laporan — rekap + export CSV\n\n' +
   '⚙️ <b>Lainnya</b>\n' +
   '  /clearchat — bersihkan pesan bot di chat ini\n' +
@@ -544,6 +546,11 @@ bot.command('adduser', async (ctx) => {
 
 // =====================================================================
 //  /riwayat
+//  Format: /riwayat [jumlah] [tgl_awal] [tgl_akhir] [nama_dompet]
+//  - jumlah        : maks transaksi per tipe PER dompet (default 10)
+//  - tgl           : dd/mm/yyyy atau dd-mm-yyyy (1 = sehari, 2 = rentang)
+//  - nama_dompet   : opsional. Partial match, case-insensitive.
+//                    Kosong atau "semua"/"all" = tampilkan semua dompet.
 // =====================================================================
 
 bot.command('riwayat', async (ctx) => {
@@ -551,16 +558,26 @@ bot.command('riwayat', async (ctx) => {
     const args = ctx.message.text.split(/\s+/).slice(1);
     let limit = 10;
     const dateArgs: { y: number; m: number; d: number }[] = [];
+    const walletTokens: string[] = [];
 
     for (const arg of args) {
       const parsed = parseDateArg(arg);
       if (parsed) {
         dateArgs.push(parsed);
-      } else if (/^\d+$/.test(arg) && dateArgs.length === 0) {
-        limit = Math.max(1, Math.min(parseInt(arg, 10), 50));
+        continue;
       }
+      if (/^\d+$/.test(arg) && dateArgs.length === 0 && walletTokens.length === 0) {
+        limit = Math.max(1, Math.min(parseInt(arg, 10), 50));
+        continue;
+      }
+      // Sisanya dianggap bagian dari nama dompet (support nama multi-kata)
+      walletTokens.push(arg);
     }
 
+    const walletQuery = walletTokens.join(' ').trim();
+    const isAllWallets = !walletQuery || /^(semua|all)$/i.test(walletQuery);
+
+    // --- Rentang tanggal ---
     let fromISO: string | null = null;
     let toISO: string | null = null;
     let periodLabel = '';
@@ -579,11 +596,52 @@ bot.command('riwayat', async (ctx) => {
       periodLabel = `📅 Periode: ${fmtLong(fromISO)} — ${fmtLong(toISO)}\n`;
     }
 
-    const build = (type: 'debit' | 'credit') => {
+    // --- Resolve dompet mana yang mau ditampilkan ---
+    let wallets: { id: string; name: string }[];
+
+    if (isAllWallets) {
+      const { data, error } = await supabase.from('wallets').select('id, name').order('name');
+      if (error) throw error;
+      wallets = data ?? [];
+    } else {
+      const { data, error } = await supabase
+        .from('wallets')
+        .select('id, name')
+        .ilike('name', `%${walletQuery}%`)
+        .order('name');
+      if (error) throw error;
+      wallets = data ?? [];
+
+      if (!wallets.length) {
+        return send(
+          ctx,
+          `⚠️ Dompet <b>${esc(walletQuery)}</b> tidak ditemukan.\nCek daftar dompet dengan /dompet`
+        );
+      }
+
+      const exact = wallets.find((w) => w.name.toLowerCase() === walletQuery.toLowerCase());
+      if (exact) {
+        wallets = [exact];
+      } else if (wallets.length > 1) {
+        const list = wallets.map((w) => `• ${esc(w.name)}`).join('\n');
+        return send(
+          ctx,
+          `🤔 Ada beberapa dompet yang cocok dengan "<b>${esc(walletQuery)}</b>":\n${list}\n\n` +
+            'Ketik nama lebih spesifik, ya.'
+        );
+      }
+    }
+
+    if (!wallets.length) {
+      return send(ctx, 'Belum ada dompet terdaftar. Buat dengan /tambahdompet');
+    }
+
+    const buildQuery = (walletId: string, type: 'debit' | 'credit') => {
       let q = supabase
         .from('transactions')
-        .select('amount, description, created_at, wallets ( name ), categories ( name )')
+        .select('amount, description, created_at, categories ( name )')
         .eq('type', type)
+        .eq('wallet_id', walletId)
         .order('created_at', { ascending: false })
         .limit(limit);
       if (fromISO) q = q.gte('created_at', fromISO);
@@ -591,52 +649,87 @@ bot.command('riwayat', async (ctx) => {
       return q;
     };
 
-    const [debitRes, creditRes] = await Promise.all([build('debit'), build('credit')]);
-    if (debitRes.error) throw debitRes.error;
-    if (creditRes.error) throw creditRes.error;
+    let msg =
+      '📋 <b>Riwayat Transaksi</b>\n' +
+      periodLabel +
+      `💳 Dompet: ${isAllWallets ? 'Semua' : esc(wallets[0].name)}\n` +
+      `🔢 Maks ${limit} per tipe per dompet\n\n`;
 
-    const debits = debitRes.data ?? [];
-    const credits = creditRes.data ?? [];
+    let grandDebit = 0;
+    let grandCredit = 0;
+    let anyTx = false;
 
-    let msg = '📋 <b>Riwayat Transaksi</b>\n' + periodLabel + `🔢 Maks ${limit} per tipe\n\n`;
+    for (const w of wallets) {
+      const [debitRes, creditRes] = await Promise.all([
+        buildQuery(w.id, 'debit'),
+        buildQuery(w.id, 'credit'),
+      ]);
+      if (debitRes.error) throw debitRes.error;
+      if (creditRes.error) throw creditRes.error;
 
-    let totalDebit = 0;
-    msg += '💸 <b>Pengeluaran</b>\n';
-    if (debits.length) {
-      debits.forEach((t: any, i: number) => {
-        totalDebit += Number(t.amount);
-        const cat = t.categories?.name || '-';
-        const wal = t.wallets?.name || '-';
-        msg +=
-          `${i + 1}. ${fmtShort(t.created_at)} · <b>${formatRp(t.amount)}</b>\n` +
-          `    ${esc(t.description || '-')} · <i>${esc(cat)}</i> · ${esc(wal)}\n`;
-      });
-    } else {
-      msg += '<i>Belum ada pengeluaran.</i>\n';
+      const debits = debitRes.data ?? [];
+      const credits = creditRes.data ?? [];
+
+      // Kalau mode "semua" dan dompet ini kosong, skip biar ga nyampah
+      if (isAllWallets && !debits.length && !credits.length) continue;
+      anyTx = true;
+
+      msg += `💳 <b>${esc(w.name)}</b>\n`;
+      msg += '━━━━━━━━━━━━━━━━━━\n';
+
+      let subDebit = 0;
+      msg += '💸 <b>Pengeluaran</b>\n';
+      if (debits.length) {
+        debits.forEach((t: any, i: number) => {
+          subDebit += Number(t.amount);
+          const cat = t.categories?.name || '-';
+          msg +=
+            `${i + 1}. ${fmtShort(t.created_at)} · <b>${formatRp(t.amount)}</b>\n` +
+            `    ${esc(t.description || '-')} · <i>${esc(cat)}</i>\n`;
+        });
+      } else {
+        msg += '<i>Belum ada pengeluaran.</i>\n';
+      }
+
+      let subCredit = 0;
+      msg += '\n💰 <b>Pemasukan</b>\n';
+      if (credits.length) {
+        credits.forEach((t: any, i: number) => {
+          subCredit += Number(t.amount);
+          msg +=
+            `${i + 1}. ${fmtShort(t.created_at)} · <b>${formatRp(t.amount)}</b>\n` +
+            `    ${esc(t.description || '-')}\n`;
+        });
+      } else {
+        msg += '<i>Belum ada pemasukan.</i>\n';
+      }
+
+      const subDiff = subCredit - subDebit;
+      msg +=
+        `\n💰 Total Pemasukan: ${formatRp(subCredit)}\n` +
+        `💸 Total Pengeluaran: ${formatRp(subDebit)}\n` +
+        `${subDiff >= 0 ? '📈' : '📉'} Selisih: ${formatRp(subDiff)}\n\n`;
+
+      grandDebit += subDebit;
+      grandCredit += subCredit;
     }
 
-    let totalCredit = 0;
-    msg += '\n💰 <b>Pemasukan</b>\n';
-    if (credits.length) {
-      credits.forEach((t: any, i: number) => {
-        totalCredit += Number(t.amount);
-        const wal = t.wallets?.name || '-';
-        msg +=
-          `${i + 1}. ${fmtShort(t.created_at)} · <b>${formatRp(t.amount)}</b>\n` +
-          `    ${esc(t.description || '-')} → ${esc(wal)}\n`;
-      });
-    } else {
-      msg += '<i>Belum ada pemasukan.</i>\n';
+    if (!anyTx) {
+      msg += '<i>Belum ada transaksi pada periode/dompet ini.</i>\n\n';
     }
 
-    const diff = totalCredit - totalDebit;
-    msg +=
-      '\n━━━━━━━━━━━━━━━━━━\n' +
-      `💰 Total Pemasukan: ${formatRp(totalCredit)}\n` +
-      `💸 Total Pengeluaran: ${formatRp(totalDebit)}\n` +
-      `${diff >= 0 ? '📈' : '📉'} Selisih: ${formatRp(diff)}`;
+    // Ringkasan keseluruhan cuma relevan kalau nampilin lebih dari 1 dompet
+    if (wallets.length > 1) {
+      const grandDiff = grandCredit - grandDebit;
+      msg +=
+        '📊 <b>Ringkasan Keseluruhan</b>\n' +
+        '━━━━━━━━━━━━━━━━━━\n' +
+        `💰 Total Pemasukan: ${formatRp(grandCredit)}\n` +
+        `💸 Total Pengeluaran: ${formatRp(grandDebit)}\n` +
+        `${grandDiff >= 0 ? '📈' : '📉'} Selisih: ${formatRp(grandDiff)}`;
+    }
 
-    await sendLong(ctx, msg);
+    await sendLong(ctx, msg.trim());
   } catch (err) {
     console.error('[riwayat]', err);
     await send(ctx, '❌ Gagal mengambil riwayat.');
